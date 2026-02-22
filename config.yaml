@@ -1,0 +1,84 @@
+exchange:
+  name: "binance_futures"
+  rest_base_url: "https://fapi.binance.com"
+  ws_base_url: "wss://fstream.binance.com/ws"
+  symbol: "BTCUSDT"
+  depth_limit: 20
+  trades_limit: 1000
+  kline_interval: "5m"    # ← 5-minute bars (changed from 1m)
+  kline_limit: 1500
+
+database:
+  path: "data/market_data.db"
+
+collection:
+  target_days: 60
+  days_history: 60
+  incremental: true
+  integrity_check: true
+  pagination_sleep_seconds: 0.2
+
+target:
+  horizon_bars: 3                  # predict 3 bars ahead = 15 minutes
+  primary_target_col: "target_primary"
+  label_mode: "vol_breakout"
+  deadzone_threshold: 0.002        # ±0.2% dead zone
+  vol_breakout_bars: 3
+  vol_breakout_percentile: 55      # label top 55% of moves as signal
+  regime_vol_threshold: 0.003      # adjusted for 5m bars
+
+model:
+  random_state: 42
+  primary: "lightgbm"
+  use_regime_models: false
+  compare_stacking: false
+  lgbm_num_leaves: 63
+  lgbm_learning_rate: 0.02
+  lgbm_n_estimators: 1000
+  lgbm_min_child_samples: 50
+  lgbm_subsample: 0.7
+  lgbm_colsample_bytree: 0.7
+  lgbm_reg_alpha: 0.3
+  lgbm_reg_lambda: 2.0
+  lgbm_early_stopping_rounds: 75
+
+thresholds:
+  min_accuracy: 0.52
+  min_auc: 0.54
+  min_auc_std: 0.06
+  min_sharpe: 0.5
+  min_trades_per_day: 2.0
+
+signal:
+  low_vol_buy: 0.60
+  low_vol_sell: 0.40
+  high_vol_buy: 0.65
+  high_vol_sell: 0.35
+  vol_regime_threshold: 0.003
+  optimize_threshold: true
+
+backtest:
+  fee_bps: 4.0
+  slippage_bps: 3.0
+  latency_bps: 1.0
+  funding_bps_per_bar: 0.5
+  execute_on_open: true
+  signal_threshold_sweep_step: 0.02
+  label_horizon_bars: 3          # must match target.horizon_bars
+  bar_size_minutes: 5            # 5m candles
+  max_trades_per_day: 50.0       # 5m bars: max ~288 bars/day, 50 trades/day is reasonable
+
+validation:
+  n_folds: 5
+  min_train_rows: 2000
+  min_test_rows: 400
+
+feature_pruning:
+  correlation_threshold: 0.95
+  shap_top_k: 60
+  min_fold_stability: 0.4
+
+live:
+  poll_seconds: 5
+  emit_every_iterations: 12    # emit every 12 * 5s = 60 seconds
+  max_iterations: 100000
