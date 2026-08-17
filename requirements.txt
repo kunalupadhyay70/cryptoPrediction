@@ -9,3 +9,5 @@ catboost
 shap
 pydantic>=2,<3
 pytest
+matplotlib
+joblib
