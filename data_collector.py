@@ -169,7 +169,13 @@ class DataCollector:
             oldest_candle   — ISO timestamp of earliest stored candle
             newest_candle   — ISO timestamp of latest stored candle
             api_calls       — number of HTTP requests made
-            integrity       — sub-dict with gap_count, span_days, issues list
+            integrity       — sub-dict with gap_count, missing_bars,
+                              duplicates, span_days, issues list (Stage 2C:
+                              gap_count/missing_bars/duplicates are now
+                              interval-aware, sourced from
+                              run_integrity_check()'s gap_events/
+                              missing_bars/duplicates — see that method's
+                              docstring for the exact gap-detection formula)
         """
         total_minutes = self.config.target_days * 24 * 60
         end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -227,11 +233,28 @@ class DataCollector:
         total_stored, oldest, newest = self._db_stats()
 
         # Integrity check
-        integrity_result: Dict[str, Any] = {"gap_count": 0, "span_days": 0.0, "issues": []}
+        #
+        # CONTRACT NOTE (Stage 2C): run_integrity_check() now returns a dict
+        # (see its docstring) instead of List[str]. "gap_count" here is kept
+        # as the existing key name main.py already reads
+        # (result["integrity"]["gap_count"]), but its value now comes
+        # directly from the interval-aware gap_events count instead of the
+        # old approximate "count issue strings containing the word gap"
+        # derivation — the old derivation collapsed all gaps in a run into
+        # at most one summary string, so gap_count was effectively just 0 or
+        # 1 regardless of how many real gaps existed. "missing_bars" and
+        # "duplicates" are new keys, added rather than replacing anything.
+        integrity_result: Dict[str, Any] = {
+            "gap_count": 0, "missing_bars": 0, "duplicates": 0,
+            "span_days": 0.0, "issues": [],
+        }
         if self.config.integrity_check:
-            issues = self.run_integrity_check()
+            integrity = self.run_integrity_check()
+            issues = integrity["issues"]
             integrity_result["issues"] = issues
-            integrity_result["gap_count"] = sum(1 for i in issues if "gap" in i.lower())
+            integrity_result["gap_count"] = integrity["gap_events"]
+            integrity_result["missing_bars"] = integrity["missing_bars"]
+            integrity_result["duplicates"] = integrity["duplicates"]
             if oldest and newest:
                 t0 = datetime.fromisoformat(oldest)
                 t1 = datetime.fromisoformat(newest)
@@ -336,31 +359,116 @@ class DataCollector:
             ).fetchone()
         return count, (row[0] if row else None), (row[1] if row else None)
 
-    def run_integrity_check(self) -> List[str]:
-        issues: List[str] = []
+    def run_integrity_check(self) -> Dict[str, Any]:
+        """Validate OHLCV integrity for this collector's table.
+
+        Interval-aware gap detection (Stage 2C fix): expected candle spacing
+        is derived from ``self.bar_ms`` (the Stage 2A canonical interval
+        utility, computed once in ``__init__`` from the configured
+        ``kline_interval``), NOT a hardcoded "> 2 minutes" threshold. The
+        previous hardcoded threshold implicitly assumed ~1-minute bars —
+        for a configured 5m interval, consecutive valid candles are 5
+        minutes apart, so the old ">2 minute" rule flagged essentially every
+        adjacent pair as a gap (Stage 0 reproduced this: 19,999/20,000 valid
+        synthetic 5-minute bars were incorrectly flagged as gaps).
+
+        Ordering: rows are read via ``ORDER BY open_time ASC``, so the gap
+        scan below always walks candles in chronological order as stored.
+        This does not detect whether rows were *inserted* out of order
+        (SQLite has no notion of insertion order independent of the primary
+        key here) — only whether, once sorted, the sequence of timestamps is
+        internally consistent (see the "Non-monotonic" check below, which is
+        a defensive no-op today precisely because the query itself already
+        sorts, but is kept in case a future caller feeds in an unsorted
+        list).
+
+        Returns a dict (CONTRACT CHANGE — see note at the end):
+            rows          — total row count examined for this symbol
+            duplicates    — count of duplicate ``open_time`` values (extra
+                             occurrences beyond the first of each timestamp)
+            gap_events    — count of individual gaps, i.e. consecutive-row
+                             deltas strictly greater than one configured bar
+                             duration (``self.bar_ms``)
+            missing_bars  — total number of missing candles summed across
+                             all gap events; for one gap with
+                             ``delta = current_open_time - previous_open_time``,
+                             the missing-bar count is
+                             ``(delta // self.bar_ms) - 1`` (e.g. for a 5m
+                             interval, 00:00 -> 00:15 has delta=15m,
+                             missing = (15m // 5m) - 1 = 2, namely 00:05 and
+                             00:10)
+            issues        — human-readable issue strings, kept for logging
+
+        CONTRACT CHANGE (Stage 2C): this method previously returned
+        ``List[str]`` (just the ``issues`` messages). It now returns the
+        dict above. A repo-wide search found exactly one caller —
+        ``collect_historical_paginated`` in this same module — which has
+        been updated accordingly in this change. No other module currently
+        calls ``run_integrity_check`` directly.
+        """
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT open_time FROM {self.ohlcv_table} WHERE symbol = ? ORDER BY open_time ASC",
                 (self.config.symbol,),
             ).fetchall()
+
         if not rows:
-            return ["No data found"]
+            return {
+                "rows": 0,
+                "duplicates": 0,
+                "gap_events": 0,
+                "missing_bars": 0,
+                "issues": ["No data found"],
+            }
+
         times = [r[0] for r in rows]
-        if len(times) != len(set(times)):
-            issues.append(f"Found {len(times) - len(set(times))} duplicate timestamps")
-        gap_count = 0
-        prev_dt = datetime.fromisoformat(times[0])
-        for ts in times[1:]:
-            curr_dt = datetime.fromisoformat(ts)
-            diff = (curr_dt - prev_dt).total_seconds() / 60
-            if diff < 0:
-                issues.append(f"Non-monotonic timestamp near {ts}")
-            elif diff > 2:
-                gap_count += 1
-            prev_dt = curr_dt
-        if gap_count > 0:
-            issues.append(f"Found {gap_count} gaps > 2 minutes (likely exchange downtime)")
-        return issues
+        times_ms = [int(datetime.fromisoformat(t).timestamp() * 1000) for t in times]
+
+        issues: List[str] = []
+
+        # Duplicate detection: count occurrences beyond the first of each
+        # timestamp. Duplicates are reported, never silently dropped before
+        # the gap scan below (a duplicate produces delta == 0 between the
+        # repeated rows, which the gap scan below correctly treats as
+        # neither a gap nor a non-monotonic error).
+        seen = set()
+        duplicates = 0
+        for t in times_ms:
+            if t in seen:
+                duplicates += 1
+            else:
+                seen.add(t)
+        if duplicates:
+            issues.append(f"Found {duplicates} duplicate timestamp(s)")
+
+        gap_events = 0
+        missing_bars = 0
+        for i in range(1, len(times_ms)):
+            delta = times_ms[i] - times_ms[i - 1]
+            if delta < 0:
+                issues.append(f"Non-monotonic timestamp near {times[i]}")
+                continue
+            if delta == 0:
+                # Duplicate row — already counted above, not a gap.
+                continue
+            if delta > self.bar_ms:
+                missing = (delta // self.bar_ms) - 1
+                gap_events += 1
+                missing_bars += missing
+
+        if gap_events:
+            issues.append(
+                f"Found {gap_events} gap event(s) totaling {missing_bars} missing "
+                f"{self.config.kline_interval} bar(s)"
+            )
+
+        return {
+            "rows": len(times_ms),
+            "duplicates": duplicates,
+            "gap_events": gap_events,
+            "missing_bars": missing_bars,
+            "issues": issues,
+        }
 
     async def collect_orderbook_ws(self, seconds: int) -> None:
         end = time.time() + seconds
