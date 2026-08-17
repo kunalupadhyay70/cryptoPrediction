@@ -1,35 +1,53 @@
 """
-Main — upgraded pipeline:
-1. Paginated historical data collection (30–90 days)
-2. Integrity validation
-3. Configurable label modes
-4. Correlation + SHAP feature pruning
-5. Walk-forward cross-validation (5 folds, no leakage)
-6. Regime-specific models (high-vol / low-vol)
-7. Threshold sweep optimisation (maximise Sharpe)
-8. Rich backtest reporting
-9. Full artifact persistence
+Main — canonical pipeline entrypoint (Stage 2P runtime cutover).
+
+This REPLACES the legacy dict-config-driven pipeline (global-percentile
+vol_breakout labels, static regime-threshold signal config, model-type
+switching via ModelConfig/StackedEnsembleModel/RegimeModelSet/Backtester/
+SignalEngine in model.py/feature_engineering.py/backtester.py/
+signal_engine.py) with the frozen Stage 1-2O architecture:
+
+  - config_schema.AppConfig is the single canonical configuration contract
+    (loaded via config_schema.load_config -- strict, fails loudly on any
+    unknown/missing/out-of-range field).
+  - target_engineering / dataset_builder build the causal, ATR-scaled
+    3-class target and OHLCV-only features (never the legacy binary
+    vol_breakout/dead-zone labels).
+  - oof_builder / threshold_selection / position_engine / metrics /
+    production_model / experiment_runner ARE the pipeline: purge-aware
+    expanding walk-forward, fold-local feature selection, canonical OOF
+    generation, past-only threshold selection, the FLAT/LONG/SHORT
+    accounting engine, predictive + trading metrics, the passive-long
+    benchmark, and production model training/persistence.
+
+`_parse_bar_minutes` (the Stage 0 audit finding: bar duration silently
+re-derived from a local regex instead of the canonical interval authority)
+is REMOVED in this cutover -- bar duration is never computed here at all;
+intervals.py (via config_schema.DataConfig's own validation and
+DataCollector's config.kline_interval) remains the single canonical
+authority, exactly as it has been since Stage 2A.
+
+model.py, feature_engineering.py, backtester.py, and signal_engine.py are
+NOT imported anywhere in this file any more. They are left in place for
+this stage (Stage 2P is a runtime CUTOVER, not a deletion pass) but are
+dead code from main.py's perspective; removing the files themselves is
+Stage 2S's "clean repository" job, not this stage's.
 """
+from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
 
-import pandas as pd
-import yaml
-
-from backtester import BacktestConfig, Backtester
+from config_schema import AppConfig, load_config
 from data_collector import DataCollector, DataCollectorConfig
-from feature_engineering import FeatureConfig, FeatureEngineer, feature_columns
-from model import (
-    ModelConfig,
-    RegimeModelSet,
-    StackedEnsembleModel,
-    prune_correlated_features,
-    prune_shap_features,
-)
-from signal_engine import SignalConfig, SignalEngine
+from dataset_builder import build_dataset, feature_columns
+from experiment_runner import run_experiment
+from oof_builder import ALL_MODELS, MODEL_LIGHTGBM, OOFPipelineConfig
+from production_model import ProductionModelResult, predict_proba_production
+from threshold_selection import compute_signal, select_production_threshold
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,345 +59,241 @@ def setup_logging() -> None:
     )
 
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def build_components(cfg: dict):
-    collector = DataCollector(
+def build_collector(cfg: AppConfig) -> DataCollector:
+    return DataCollector(
         DataCollectorConfig(
-            exchange_name=cfg["exchange"]["name"],
-            rest_base_url=cfg["exchange"]["rest_base_url"],
-            ws_base_url=cfg["exchange"]["ws_base_url"],
-            symbol=cfg["exchange"]["symbol"],
-            depth_limit=cfg["exchange"]["depth_limit"],
-            trades_limit=cfg["exchange"]["trades_limit"],
-            kline_interval=cfg["exchange"]["kline_interval"],
-            kline_limit=cfg["exchange"]["kline_limit"],
-            db_path=cfg["database"]["path"],
-            target_days=cfg["collection"]["target_days"],
-            pagination_sleep=cfg["collection"]["pagination_sleep_seconds"],
+            exchange_name=cfg.data.exchange,
+            rest_base_url=cfg.data.rest_base_url,
+            ws_base_url=cfg.data.ws_base_url,
+            symbol=cfg.data.symbol,
+            depth_limit=cfg.data.depth_limit,
+            trades_limit=cfg.data.trades_limit,
+            kline_interval=cfg.data.interval,
+            kline_limit=cfg.data.kline_limit,
+            db_path=cfg.data.db_path,
+            target_days=cfg.data.target_days,
+            pagination_sleep=cfg.data.pagination_sleep_seconds,
+            incremental=cfg.data.incremental,
+            integrity_check=cfg.data.integrity_check,
         )
     )
 
-    tgt = cfg["target"]
-    kline_interval = cfg["exchange"]["kline_interval"]
-    ohlcv_table    = f"ohlcv_{kline_interval}"
 
-    fe = FeatureEngineer(
-        FeatureConfig(
-            db_path=cfg["database"]["path"],
-            label_horizon_bars=tgt["horizon_bars"],
-            label_mode=tgt["label_mode"],
-            deadzone_threshold=tgt.get("deadzone_threshold", 0.0005),
-            vol_breakout_percentile=tgt.get("vol_breakout_percentile", 70),
-            vol_breakout_bars=tgt.get("vol_breakout_bars", 3),
-            regime_vol_threshold=tgt.get("regime_vol_threshold", 0.0015),
-            ohlcv_table=ohlcv_table,
-        )
+def _lgbm_params(cfg: AppConfig) -> dict:
+    lg = cfg.models.lightgbm
+    return {
+        "num_leaves": lg.num_leaves, "learning_rate": lg.learning_rate, "n_estimators": lg.n_estimators,
+        "min_child_samples": lg.min_child_samples, "subsample": lg.subsample,
+        "colsample_bytree": lg.colsample_bytree, "reg_alpha": lg.reg_alpha, "reg_lambda": lg.reg_lambda,
+    }
+
+
+def _oof_config_from_app_config(cfg: AppConfig) -> OOFPipelineConfig:
+    return OOFPipelineConfig(
+        n_folds=cfg.validation.n_folds,
+        min_train_rows=cfg.validation.min_train_rows,
+        min_test_rows=cfg.validation.min_test_rows,
+        horizon_bars=cfg.target.horizon_bars,  # purge size == target.horizon_bars, always
+        embargo_bars=cfg.validation.embargo_bars,
+        min_class_count=cfg.validation.min_class_count,
+        correlation_threshold=cfg.features.correlation_threshold,
+        importance_top_k=cfg.features.importance_top_k,
+        internal_validation_fraction=cfg.validation.internal_validation_fraction,
+        lgbm_early_stopping_rounds=cfg.models.lightgbm.early_stopping_rounds,
+        random_state=cfg.models.random_state,
+        lgbm_params=_lgbm_params(cfg),
     )
 
-    val_cfg = cfg.get("validation", {})
-    fp_cfg = cfg.get("feature_pruning", {})
-    thr = cfg["thresholds"]
-    model_cfg = cfg.get("model", {})
 
-    model_config = ModelConfig(
-        random_state=model_cfg.get("random_state", 42),
-        primary=model_cfg.get("primary", "lightgbm"),
-        n_folds=val_cfg.get("n_folds", 5),
-        min_train_rows=val_cfg.get("min_train_rows", 5000),
-        min_auc=thr.get("min_auc", 0.58),
-        max_auc_std=thr.get("min_auc_std", 0.05),
-        use_regime_models=model_cfg.get("use_regime_models", True),
-        compare_stacking=model_cfg.get("compare_stacking", True),
-        shap_top_k=fp_cfg.get("shap_top_k", 50),
-        correlation_threshold=fp_cfg.get("correlation_threshold", 0.95),
-        min_fold_stability=fp_cfg.get("min_fold_stability", 0.6),
-    )
-
-    model = StackedEnsembleModel(model_config)
-    regime_model = RegimeModelSet(model_config) if model_cfg.get("use_regime_models", True) else None
-
-    bt_cfg = cfg["backtest"]
-    def _parse_bar_minutes(iv: str) -> int:
-        iv = iv.strip().lower()
-        if iv.endswith("h"): return int(iv[:-1]) * 60
-        if iv.endswith("m"): return int(iv[:-1])
-        return 1
-    bar_mins = bt_cfg.get("bar_size_minutes", _parse_bar_minutes(kline_interval))
-
-    bt = Backtester(
-        BacktestConfig(
-            fee_bps=bt_cfg["fee_bps"],
-            slippage_bps=bt_cfg["slippage_bps"],
-            latency_bps=bt_cfg["latency_bps"],
-            funding_bps_per_bar=bt_cfg["funding_bps_per_bar"],
-            min_auc=thr.get("min_auc", 0.58),
-            min_sharpe=thr.get("min_sharpe", 1.5),
-            min_trades_per_day=thr.get("min_trades_per_day", 2.0),
-            threshold_sweep_step=bt_cfg.get("signal_threshold_sweep_step", 0.01),
-            optimize_threshold=cfg["signal"].get("optimize_threshold", True),
-            label_horizon_bars=bt_cfg.get("label_horizon_bars", tgt["horizon_bars"]),
-            bar_size_minutes=bar_mins,
-            max_trades_per_day=bt_cfg.get("max_trades_per_day", 200.0),
-        )
-    )
-
-    sig_cfg = cfg["signal"]
-    se = SignalEngine(
-        SignalConfig(
-            low_vol_buy=sig_cfg["low_vol_buy"],
-            low_vol_sell=sig_cfg["low_vol_sell"],
-            high_vol_buy=sig_cfg["high_vol_buy"],
-            high_vol_sell=sig_cfg["high_vol_sell"],
-            vol_regime_threshold=sig_cfg["vol_regime_threshold"],
-        )
-    )
-    return collector, fe, model, regime_model, bt, se, model_config
+def _threshold_kwargs(cfg: AppConfig) -> dict:
+    bt = cfg.backtest
+    return {
+        "threshold_sweep_min": bt.threshold_sweep_min, "threshold_sweep_max": bt.threshold_sweep_max,
+        "threshold_sweep_step": bt.threshold_sweep_step, "min_trades_for_tuning": bt.min_trades_for_tuning,
+        "default_buy_threshold": bt.default_buy_threshold, "default_sell_threshold": bt.default_sell_threshold,
+    }
 
 
-def _prepare_dataset(fe: FeatureEngineer, min_rows: int = 100) -> pd.DataFrame:
-    ds = fe.build_dataset()
-    if ds.empty:
-        return ds
-    ds = ds.dropna(subset=["target_primary"]).reset_index(drop=True)
-    if len(ds) < min_rows:
-        LOGGER.warning("Dataset too small: %d rows (need %d)", len(ds), min_rows)
-        return pd.DataFrame()
-    return ds
+def _backtest_kwargs(cfg: AppConfig) -> dict:
+    bt = cfg.backtest
+    return {
+        "initial_equity": bt.initial_equity, "position_fraction": bt.position_fraction,
+        "fee_bps": bt.fee_bps, "slippage_bps": bt.slippage_bps, "latency_bps": bt.latency_bps,
+        "funding_bps_per_bar": bt.funding_bps_per_bar,
+    }
 
 
-def _run_feature_pruning(
-    ds: pd.DataFrame,
-    model: StackedEnsembleModel,
-    model_config: ModelConfig,
-    cols: list,
-    target_col: str,
-) -> list:
-    LOGGER.info("Feature pruning: starting with %d features", len(cols))
-
-    # Step 1: Remove highly correlated features
-    cols = prune_correlated_features(ds, cols, threshold=model_config.correlation_threshold)
-
-    # Step 2: SHAP importance pruning on a 50% sample
-    n = len(ds)
-    half = n // 2
-    if half > 1000:
-        from sklearn.impute import SimpleImputer
-        import numpy as np
-        imp = SimpleImputer(strategy="median")
-        X_half = (
-            ds[cols].iloc[:half]
-            .replace([float("inf"), float("-inf")], float("nan"))
-            .fillna(0.0)
-        )
-        X_half_imp = pd.DataFrame(imp.fit_transform(X_half), columns=cols)
-        y_half = pd.to_numeric(ds[target_col].iloc[:half], errors="coerce").dropna()
-        X_half_imp = X_half_imp.loc[y_half.index]
-        try:
-            shap_model = model._make_primary_model()
-            shap_model.fit(X_half_imp, y_half)
-            cols = prune_shap_features(shap_model, X_half_imp, cols, top_k=model_config.shap_top_k)
-        except Exception as exc:
-            LOGGER.warning("SHAP pruning failed: %s", exc)
-
-    LOGGER.info("Feature pruning complete: %d features retained", len(cols))
-    return cols
-
-
-def train_backtest(cfg: dict) -> None:
+def train_backtest(cfg: AppConfig, output_dir: str = None) -> None:
     LOGGER.info("=" * 80)
-    LOGGER.info("TRAIN & BACKTEST MODE (v2 upgraded pipeline)")
+    LOGGER.info("TRAIN & BACKTEST (canonical Stage 1-2O pipeline)")
     LOGGER.info("=" * 80)
 
-    collector, fe, model, regime_model, bt, se, model_config = build_components(cfg)
-    collector.create_version("train_backtest_v2_paginated")
+    collector = build_collector(cfg)
+    collector.create_version("stage2p_canonical_pipeline")
 
-    # ── 1. Data collection ───────────────────────────────────────────────
-    LOGGER.info("Collecting %d days of 1-minute data (paginated)...", cfg["collection"]["target_days"])
-    result = collector.collect_historical_paginated()
-    collector.collect_orderbook_snapshot()
+    LOGGER.info("Collecting %d days of %s data (paginated)...", cfg.data.target_days, cfg.data.interval)
+    try:
+        result = collector.collect_historical_paginated()
+        LOGGER.info("Data collection result: %s", result)
+    except Exception as exc:
+        LOGGER.warning(
+            "Data collection failed (%s) -- proceeding with whatever OHLCV is already stored locally.", exc
+        )
 
-    integrity = result.get("integrity", {})
-    if integrity.get("gap_count", 0) > 0:
-        LOGGER.warning("Data has %d time gaps — features will forward-fill across gaps", integrity["gap_count"])
+    if cfg.data.integrity_check:
+        integrity = collector.run_integrity_check()
+        if integrity["gap_events"] > 0:
+            LOGGER.warning(
+                "Data has %d gap event(s), %d missing bar(s) total -- NOT auto-filled "
+                "(this pipeline never forward-fills OHLCV gaps).",
+                integrity["gap_events"], integrity["missing_bars"],
+            )
 
-    if result["total_stored"] < cfg.get("validation", {}).get("min_train_rows", 5000):
+    ohlcv = collector.load_ohlcv_dataframe()
+    if len(ohlcv) < cfg.validation.min_train_rows:
         LOGGER.error(
-            "Insufficient data: %d rows. Need >= %d. Increase target_days in config.",
-            result["total_stored"], cfg.get("validation", {}).get("min_train_rows", 5000),
+            "Insufficient data: %d rows stored, need >= %d (validation.min_train_rows). "
+            "Increase data.target_days or wait for more history to accumulate.",
+            len(ohlcv), cfg.validation.min_train_rows,
         )
         return
-    LOGGER.info("Data ready | %d rows | %.1f days", result["total_stored"], integrity.get("span_days", 0))
-
-    # ── 2. Feature engineering ───────────────────────────────────────────
-    LOGGER.info("Building features (label_mode=%s)...", cfg["target"]["label_mode"])
-    ds = _prepare_dataset(fe, min_rows=1000)
-    if ds.empty:
-        LOGGER.error("Feature dataset empty. Check DB and config.")
-        return
-
-    target_col = cfg["target"]["primary_target_col"]
-    cols = feature_columns(ds)
-    LOGGER.info("Dataset: %d rows | %d raw features | label balance: %.1f%%",
-                len(ds), len(cols), ds[target_col].mean() * 100)
-
-    # ── 3. Feature pruning ───────────────────────────────────────────────
-    cols = _run_feature_pruning(ds, model, model_config, cols, target_col)
-
-    # ── 4. Walk-forward cross-validation ────────────────────────────────
-    LOGGER.info("Walk-forward CV (%d folds)...", model_config.n_folds)
-    metrics = model.fit_evaluate(ds, cols, target_col)
-
-    fold_metrics = metrics.get("fold_metrics", [])
-    LOGGER.info(
-        "CV Results | Mean AUC: %.4f ± %.4f | Worst fold: %.4f | Folds: %d",
-        metrics["roc_auc"], metrics.get("roc_auc_std", 0),
-        metrics.get("worst_fold_auc", 0), metrics.get("n_folds_used", 0),
-    )
-    for fm in fold_metrics:
-        LOGGER.info("  Fold %d: AUC=%.4f | Acc=%.4f | train=%d | test=%d",
-                    fm["fold"], fm["auc"], fm["accuracy"], fm["train_rows"], fm["test_rows"])
-
-    # ── 5. Regime models ─────────────────────────────────────────────────
-    regime_metrics = {}
-    if regime_model is not None and "vol_regime" in ds.columns:
-        LOGGER.info("Training regime-specific models...")
-        regime_metrics = regime_model.fit_evaluate(ds, cols, target_col)
-        for r, m in regime_metrics.items():
-            LOGGER.info("  Regime '%s': AUC=%.4f ± %.4f", r, m.get("roc_auc", 0), m.get("roc_auc_std", 0))
-
-    # ── 6. Backtest with threshold sweep ─────────────────────────────────
-    LOGGER.info("Backtesting with threshold optimisation...")
-    ds_bt = ds.copy()
-    ds_bt["pred_prob"] = model.predict_proba(ds_bt, cols)
-    report = bt.run(ds_bt, "pred_prob", target_col, metrics)
-
-    if bt.optimal_threshold_ is not None:
-        se.set_optimal_thresholds(report.get("buy_threshold", 0.55), report.get("sell_threshold", 0.45))
 
     LOGGER.info(
-        "Backtest | Status: %s | Sharpe: %.2f | MaxDD: %.1f%% | "
-        "Trades/day: %.1f | WinRate: %.1f%% | Thresholds: %.2f/%.2f",
-        report.get("status"),
-        report.get("sharpe", 0),
-        abs(report.get("max_drawdown", 0)) * 100,
-        report.get("trades_per_day", 0),
-        report.get("win_rate", 0) * 100,
-        report.get("buy_threshold", 0.55),
-        report.get("sell_threshold", 0.45),
+        "Building causal features + target (horizon_bars=%d, neutral_atr_mult=%.3f, atr_period=%d)...",
+        cfg.target.horizon_bars, cfg.target.neutral_atr_mult, cfg.target.atr_period,
+    )
+    dataset = build_dataset(
+        ohlcv, horizon_bars=cfg.target.horizon_bars, neutral_atr_mult=cfg.target.neutral_atr_mult,
+        atr_period=cfg.target.atr_period, lag_periods=cfg.features.lag_periods,
+    )
+    candidate_features = feature_columns(dataset)
+    LOGGER.info("Dataset: %d rows | %d candidate features", len(dataset), len(candidate_features))
+
+    oof_config = _oof_config_from_app_config(cfg)
+    out_dir = output_dir or str(Path(cfg.artifacts.root_dir) / cfg.experiment.name)
+
+    exp_result = run_experiment(
+        dataset, candidate_features, symbol=cfg.data.symbol, interval=cfg.data.interval,
+        run_id=cfg.experiment.name, oof_config=oof_config, output_dir=out_dir,
+        min_fold_stability=cfg.features.min_fold_stability,
+        threshold_kwargs=_threshold_kwargs(cfg), backtest_kwargs=_backtest_kwargs(cfg),
+        production_lgbm_params=_lgbm_params(cfg),
     )
 
-    # ── 7. Save artifacts ────────────────────────────────────────────────
-    Path("artifacts").mkdir(exist_ok=True)
-
-    ds_bt.to_csv("artifacts/model_dataset.csv", index=False)
-    pd.DataFrame([{**metrics, **report}]).to_csv("artifacts/backtest_report.csv", index=False)
-
-    if fold_metrics:
-        pd.DataFrame(fold_metrics).to_csv("artifacts/fold_metrics.csv", index=False)
-
-    pd.DataFrame({"feature": cols}).to_csv("artifacts/selected_features.csv", index=False)
-
-    if regime_metrics:
-        rows = [{"regime": r, **{k: v for k, v in m.items() if k != "fold_metrics"}}
-                for r, m in regime_metrics.items()]
-        pd.DataFrame(rows).to_csv("artifacts/regime_metrics.csv", index=False)
-
-    with open("artifacts/config_snapshot.yaml", "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False)
+    # Production/live thresholds (Stage 2K's separate "computed once from
+    # full historical OOF" rule) -- persisted alongside the rest of the
+    # experiment artifacts, NEVER used to recompute the metrics.json values
+    # already written by run_experiment above.
+    production_threshold = select_production_threshold(
+        exp_result.oof_df, MODEL_LIGHTGBM, **_threshold_kwargs(cfg),
+    )
+    Path(out_dir, "production_thresholds.json").write_text(json.dumps({
+        "model": MODEL_LIGHTGBM,
+        "buy_threshold": production_threshold.buy_threshold,
+        "sell_threshold": production_threshold.sell_threshold,
+        "buy_used_fallback": production_threshold.buy_used_fallback,
+        "sell_used_fallback": production_threshold.sell_used_fallback,
+    }, indent=2))
 
     LOGGER.info("=" * 80)
-    LOGGER.info("ARTIFACTS SAVED → artifacts/")
-    LOGGER.info("  model_dataset.csv    — full labeled dataset with predictions")
-    LOGGER.info("  backtest_report.csv  — combined model + backtest metrics")
-    LOGGER.info("  fold_metrics.csv     — per-fold CV results")
-    LOGGER.info("  selected_features.csv — pruned feature list")
-    LOGGER.info("  regime_metrics.csv   — regime-split model performance")
-    LOGGER.info("  config_snapshot.yaml — reproducibility snapshot")
-    LOGGER.info("=" * 80)
-    LOGGER.info("FINAL: AUC %.4f±%.4f | Sharpe %.2f | Status: %s",
-                metrics["roc_auc"], metrics.get("roc_auc_std", 0),
-                report.get("sharpe", 0), report.get("status"))
-    LOGGER.info("=" * 80)
-
-
-def live(cfg: dict) -> None:
-    LOGGER.info("=" * 80)
-    LOGGER.info("LIVE TRADING MODE (v2)")
+    LOGGER.info("ARTIFACTS SAVED -> %s", out_dir)
+    for model in ALL_MODELS:
+        tm = exp_result.trading_metrics_by_model[model]
+        LOGGER.info(
+            "  %-24s | total_return=%.4f sharpe=%s max_dd=%.4f trades=%d",
+            model, tm.total_return,
+            ("%.2f" % tm.sharpe_daily_compounded) if tm.sharpe_daily_compounded == tm.sharpe_daily_compounded else "nan",
+            tm.max_drawdown, tm.trade_count,
+        )
+    bm = exp_result.benchmark_trading_metrics
+    LOGGER.info("  %-24s | total_return=%.4f max_dd=%.4f (passive-long benchmark)", "benchmark", bm.total_return, bm.max_drawdown)
+    LOGGER.info(
+        "  production threshold (lightgbm) | buy=%.3f sell=%.3f",
+        production_threshold.buy_threshold, production_threshold.sell_threshold,
+    )
     LOGGER.info("=" * 80)
 
-    collector, fe, model, regime_model, bt, se, model_config = build_components(cfg)
 
-    # Incremental data refresh
-    LOGGER.info("Incremental data refresh...")
-    collector.collect_historical_paginated()
-    collector.collect_orderbook_snapshot()
+def live(cfg: AppConfig) -> None:
+    """Production inference loop (Stage 1 §2's "Production Inference
+    Pipeline"). Loads the most recently trained production model artifact
+    and polls the exchange for fresh bars, computing a signal with the
+    SAME frozen SIGNAL RULE used everywhere else in this codebase
+    (threshold_selection.compute_signal) -- never a separate
+    reimplementation. Uses the production_thresholds.json artifact written
+    by train_backtest (computed once from full historical OOF); falls back
+    to config.yaml's default_buy_threshold/default_sell_threshold if that
+    artifact is not present.
+    """
+    LOGGER.info("=" * 80)
+    LOGGER.info("LIVE / INFERENCE MODE (canonical pipeline)")
+    LOGGER.info("=" * 80)
 
-    ds = _prepare_dataset(fe, min_rows=5000)
-    if ds.empty:
-        LOGGER.error("Not enough data. Run train_backtest first.")
+    out_dir = Path(cfg.artifacts.root_dir) / cfg.experiment.name
+    model_path = out_dir / "production_model.joblib"
+    selected_features_path = out_dir / "selected_features.json"
+    if not model_path.exists() or not selected_features_path.exists():
+        LOGGER.error("No production model found at %s. Run train_backtest first.", out_dir)
         return
 
-    target_col = cfg["target"]["primary_target_col"]
-    cols = feature_columns(ds)
-    cols = prune_correlated_features(ds, cols, threshold=model_config.correlation_threshold)
+    import joblib
+    model = joblib.load(model_path)
+    selected_features = json.loads(selected_features_path.read_text())
+    production = ProductionModelResult(
+        model=model, selected_features=selected_features, n_estimators=getattr(model, "n_estimators", 0),
+        lgbm_params={}, n_training_rows=0, class_counts={},
+    )
 
-    metrics = model.fit_evaluate(ds, cols, target_col)
-    LOGGER.info("Bootstrap AUC: %.4f ± %.4f", metrics["roc_auc"], metrics.get("roc_auc_std", 0))
+    thresholds_path = out_dir / "production_thresholds.json"
+    if thresholds_path.exists():
+        thresholds = json.loads(thresholds_path.read_text())
+        buy_threshold, sell_threshold = thresholds["buy_threshold"], thresholds["sell_threshold"]
+    else:
+        LOGGER.warning("No production_thresholds.json found -- falling back to config.yaml default thresholds.")
+        buy_threshold, sell_threshold = cfg.backtest.default_buy_threshold, cfg.backtest.default_sell_threshold
 
-    passes_gate = metrics["roc_auc"] >= cfg["thresholds"]["min_auc"]
-    LOGGER.info("Model gate: %s", "PASS" if passes_gate else "FAIL — HOLD only")
+    collector = build_collector(cfg)
+    max_iterations = cfg.live.max_iterations or 1_000_000_000
 
-    if passes_gate:
-        ds_bt = ds.copy()
-        ds_bt["pred_prob"] = model.predict_proba(ds_bt, cols)
-        report = bt.run(ds_bt, "pred_prob", target_col, metrics)
-        if bt.optimal_threshold_:
-            se.set_optimal_thresholds(report["buy_threshold"], report["sell_threshold"])
-            LOGGER.info("Thresholds: buy=%.2f sell=%.2f", report["buy_threshold"], report["sell_threshold"])
-
-    for step in range(cfg["live"]["max_iterations"]):
+    for step in range(max_iterations):
         collector.collect_rest_once()
 
-        if (step + 1) % cfg["live"]["emit_every_iterations"] != 0:
-            time.sleep(cfg["live"]["poll_seconds"])
+        if (step + 1) % cfg.live.emit_every_iterations != 0:
+            time.sleep(cfg.live.poll_seconds)
             continue
 
-        cur = _prepare_dataset(fe, min_rows=30)
-        if cur.empty:
-            time.sleep(cfg["live"]["poll_seconds"])
+        ohlcv = collector.load_ohlcv_dataframe()
+        min_rows_needed = cfg.target.atr_period + cfg.features.lag_periods + cfg.target.horizon_bars + 5
+        if len(ohlcv) < min_rows_needed:
+            time.sleep(cfg.live.poll_seconds)
             continue
 
-        latest = cur.tail(1)
-        try:
-            cols_live = [c for c in cols if c in latest.columns]
-            prob = float(model.predict_proba(latest, cols_live)[0])
-        except Exception as exc:
-            LOGGER.warning("Prediction failed: %s", exc)
-            time.sleep(cfg["live"]["poll_seconds"])
+        dataset = build_dataset(
+            ohlcv, horizon_bars=cfg.target.horizon_bars, neutral_atr_mult=cfg.target.neutral_atr_mult,
+            atr_period=cfg.target.atr_period, lag_periods=cfg.features.lag_periods,
+        )
+        latest = dataset.iloc[[-1]]
+        missing = [f for f in selected_features if f not in latest.columns]
+        if missing:
+            LOGGER.warning("Latest row missing features %s -- skipping this iteration.", missing)
+            time.sleep(cfg.live.poll_seconds)
             continue
 
-        volatility = float(latest["vol_5"].iloc[0]) if "vol_5" in latest.columns else 0.0
-        signal = "HOLD"
-        if passes_gate:
-            signal = se.dynamic_signal(prob, volatility, cfg["signal"]["vol_regime_threshold"])
+        probs = predict_proba_production(production, latest)
+        signal = compute_signal(probs[:, 0], probs[:, 1], probs[:, 2], buy_threshold, sell_threshold)[0]
 
-        vol_regime = int(latest["vol_regime"].iloc[0]) if "vol_regime" in latest.columns else 0
-        LOGGER.info("[%d] %s | prob=%.3f vol=%.5f regime=%s AUC=%.4f",
-                    step + 1, signal, prob, volatility,
-                    "HIGH" if vol_regime else "LOW", metrics["roc_auc"])
-
-        time.sleep(cfg["live"]["poll_seconds"])
+        LOGGER.info(
+            "[%d] signal=%s prob_down=%.3f prob_neutral=%.3f prob_up=%.3f (buy_thr=%.3f sell_thr=%.3f)",
+            step + 1, signal, probs[0, 0], probs[0, 1], probs[0, 2], buy_threshold, sell_threshold,
+        )
+        time.sleep(cfg.live.poll_seconds)
 
     LOGGER.info("Live loop ended.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="BTCUSDT 1-Min ML System v2",
+        description="BTCUSDT Perpetual Futures 3-Class Direction Model (canonical Stage 1-2O pipeline)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -389,13 +303,14 @@ Examples:
     )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--mode", choices=["train_backtest", "live"], default="train_backtest")
+    parser.add_argument("--output-dir", default=None, help="Override artifacts output directory for train_backtest.")
     args = parser.parse_args()
 
     setup_logging()
     cfg = load_config(args.config)
 
     if args.mode == "train_backtest":
-        train_backtest(cfg)
+        train_backtest(cfg, output_dir=args.output_dir)
     else:
         live(cfg)
 

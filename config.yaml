@@ -1,82 +1,97 @@
-exchange:
-  name: "binance_futures"
+# Canonical configuration (Stage 2P cutover) — validated against
+# config_schema.AppConfig. This is the SINGLE source of truth for runtime
+# configuration; main.py loads it via config_schema.load_config and fails
+# loudly on any unknown key, missing required field, or out-of-range value.
+#
+# The legacy sections this file used to have (exchange/database/collection/
+# feature_pruning/thresholds/signal, and target.label_mode /
+# target.vol_breakout_percentile / target.deadzone_threshold /
+# model.use_regime_models / model.compare_stacking / backtest.bar_size_minutes
+# / backtest.label_horizon_bars) are retired, not carried forward as
+# compatibility fields — see config_schema.py's module docstring for the
+# full list of what was deliberately NOT migrated.
+
+data:
+  exchange: "binance_futures"
+  symbol: "BTCUSDT"
+  interval: "5m"
+  target_days: 60
+  db_path: "data/market_data.db"
   rest_base_url: "https://fapi.binance.com"
   ws_base_url: "wss://fstream.binance.com/ws"
-  symbol: "BTCUSDT"
   depth_limit: 20
   trades_limit: 1000
-  kline_interval: "5m"    # ← 5-minute bars (changed from 1m)
   kline_limit: 1500
-
-database:
-  path: "data/market_data.db"
-
-collection:
-  target_days: 60
-  days_history: 60
+  pagination_sleep_seconds: 0.2
   incremental: true
   integrity_check: true
-  pagination_sleep_seconds: 0.2
 
 target:
-  horizon_bars: 3                  # predict 3 bars ahead = 15 minutes
-  primary_target_col: "target_primary"
-  label_mode: "vol_breakout"
-  deadzone_threshold: 0.002        # ±0.2% dead zone
-  vol_breakout_bars: 3
-  vol_breakout_percentile: 55      # label top 55% of moves as signal
-  regime_vol_threshold: 0.003      # adjusted for 5m bars
+  horizon_bars: 3               # predict 3 bars ahead = 15 minutes on 5m bars
+  neutral_atr_mult: 0.3
+  atr_period: 14
 
-model:
+features:
+  lag_periods: 3
+  correlation_threshold: 0.95
+  importance_top_k: 60
+  min_fold_stability: 0.4
+  include_orderbook_features: false
+
+validation:
+  n_folds: 5
+  min_train_rows: 2000
+  min_test_rows: 400
+  # purge size is ALWAYS target.horizon_bars -- there is deliberately no
+  # validation.purge_bars field (see ValidationConfig's docstring).
+  embargo_bars: 0
+  internal_validation_fraction: 0.2
+  min_class_count: 30
+
+models:
   random_state: 42
-  primary: "lightgbm"
-  use_regime_models: false
-  compare_stacking: false
-  lgbm_num_leaves: 63
-  lgbm_learning_rate: 0.02
-  lgbm_n_estimators: 1000
-  lgbm_min_child_samples: 50
-  lgbm_subsample: 0.7
-  lgbm_colsample_bytree: 0.7
-  lgbm_reg_alpha: 0.3
-  lgbm_reg_lambda: 2.0
-  lgbm_early_stopping_rounds: 75
-
-thresholds:
-  min_accuracy: 0.52
-  min_auc: 0.54
-  min_auc_std: 0.06
-  min_sharpe: 0.5
-  min_trades_per_day: 2.0
-
-signal:
-  low_vol_buy: 0.60
-  low_vol_sell: 0.40
-  high_vol_buy: 0.65
-  high_vol_sell: 0.35
-  vol_regime_threshold: 0.003
-  optimize_threshold: true
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+  lightgbm:
+    num_leaves: 63
+    learning_rate: 0.02
+    n_estimators: 1000
+    min_child_samples: 50
+    subsample: 0.7
+    colsample_bytree: 0.7
+    reg_alpha: 0.3
+    reg_lambda: 2.0
+    early_stopping_rounds: 75
+  catboost:
+    enabled: false
 
 backtest:
   fee_bps: 4.0
   slippage_bps: 3.0
   latency_bps: 1.0
   funding_bps_per_bar: 0.5
-  execute_on_open: true
-  signal_threshold_sweep_step: 0.02
-  label_horizon_bars: 3          # must match target.horizon_bars
-  bar_size_minutes: 5            # 5m candles
-  max_trades_per_day: 50.0       # 5m bars: max ~288 bars/day, 50 trades/day is reasonable
+  default_buy_threshold: 0.55
+  default_sell_threshold: 0.45
+  min_trades_for_tuning: 20
+  threshold_sweep_min: 0.34
+  threshold_sweep_max: 0.80
+  threshold_sweep_step: 0.02
+  initial_equity: 10000.0
+  position_fraction: 1.0
+  max_trades_per_day: 50.0
 
-validation:
-  n_folds: 5
-  min_train_rows: 2000
-  min_test_rows: 400
+risk:
+  enabled: false
 
-feature_pruning:
-  correlation_threshold: 0.95
-  shap_top_k: 60
-  min_fold_stability: 0.4
+artifacts:
+  root_dir: "artifacts"
+  keep_last_n_experiments: 20
+
+experiment:
+  name: "btcusdt_5m_v1"
+  tags: ["v1", "ohlcv-only"]
+  notes: "Stage 1-2O frozen architecture: causal ATR-scaled 3-class target, purge-aware expanding walk-forward, fold-local feature selection, LightGBM primary model."
 
 live:
   poll_seconds: 5
