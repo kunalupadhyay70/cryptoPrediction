@@ -20,9 +20,19 @@ import requests
 import websockets
 
 from exchange_clients import build_exchange_client
+from intervals import interval_to_milliseconds
 
 LOGGER = logging.getLogger(__name__)
-BAR_MS = 60_000  # 1-minute bar in ms
+
+# Fixed physical unit conversion (milliseconds in one minute) — used only to
+# convert a day-count lookback window into milliseconds. This is NOT the bar
+# duration and must stay independent of kline_interval; the actual bar
+# duration is computed per-instance in DataCollector.__init__ from the
+# configured interval via intervals.interval_to_milliseconds(). Stage 0 found
+# the old module-level `BAR_MS = 60_000` being reused for both purposes,
+# which silently assumed 1-minute bars everywhere it was used to advance a
+# pagination cursor — see DataCollector.bar_ms below for the fix.
+_MS_PER_MINUTE = 60_000
 
 
 @dataclass
@@ -61,6 +71,12 @@ class DataCollector:
         self.exchange_client = build_exchange_client(config.exchange_name)
         # Table name follows the interval: ohlcv_1m, ohlcv_5m, etc.
         self.ohlcv_table = f"ohlcv_{config.kline_interval}"
+        # Canonical bar duration for THIS collector's configured interval.
+        # Computed once here (fails loudly at construction time if
+        # kline_interval isn't a supported interval) and reused for every
+        # pagination-cursor calculation below instead of the old hardcoded
+        # 1-minute assumption.
+        self.bar_ms = interval_to_milliseconds(config.kline_interval)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -157,11 +173,14 @@ class DataCollector:
         """
         total_minutes = self.config.target_days * 24 * 60
         end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        target_start_ms = end_ms - (total_minutes * BAR_MS)
+        target_start_ms = end_ms - (total_minutes * _MS_PER_MINUTE)
 
         if self.config.incremental:
             newest_ms = self._get_newest_open_time_ms()
-            fetch_start_ms = (newest_ms + BAR_MS) if newest_ms else target_start_ms
+            # Advance past the newest stored candle by exactly one bar of the
+            # CONFIGURED interval (was hardcoded to +BAR_MS = +60_000ms,
+            # i.e. always "+1 minute" regardless of kline_interval).
+            fetch_start_ms = (newest_ms + self.bar_ms) if newest_ms else target_start_ms
             LOGGER.info(
                 "Incremental mode: fetching from %s",
                 datetime.fromtimestamp(fetch_start_ms / 1000, tz=timezone.utc).isoformat(),
@@ -192,7 +211,12 @@ class DataCollector:
             batch = self._parse_binance_klines(raw)
             all_klines.extend(batch)
             call_count += 1
-            cursor_ms = raw[-1][0] + BAR_MS
+            # Advance the pagination cursor by exactly one bar of the
+            # configured interval (was hardcoded to +BAR_MS = +60_000ms).
+            # For non-1m intervals the old code re-requested overlapping
+            # windows on every batch, since the next real candle is further
+            # away than 60s.
+            cursor_ms = raw[-1][0] + self.bar_ms
             LOGGER.info("Batch %d | %d candles | total so far: %d | last: %s",
                         call_count, len(batch), len(all_klines), batch[-1]["open_time"])
             time.sleep(self.config.pagination_sleep)
