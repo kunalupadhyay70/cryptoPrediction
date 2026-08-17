@@ -1,0 +1,100 @@
+# Canonical, fully-valid example configuration matching config_schema.AppConfig
+# (Stage 2B). This is a TEST FIXTURE — the repository's real config.yaml is
+# intentionally left untouched until Stage 2C migrates config.yaml + its
+# runtime consumers together.
+#
+# The lightgbm block below intentionally uses distinctive, non-default-looking
+# values (num_leaves=47, learning_rate=0.037, n_estimators=777) so tests can
+# assert those exact values survive the YAML -> AppConfig parse unchanged —
+# a direct regression guard against the Stage 0 bug where config.yaml's
+# LightGBM hyperparameters were present but silently never reached the model.
+
+data:
+  exchange: "binance_futures"
+  symbol: "BTCUSDT"
+  interval: "5m"
+  target_days: 60
+  db_path: "data/market_data.db"
+  rest_base_url: "https://fapi.binance.com"
+  ws_base_url: "wss://fstream.binance.com/ws"
+  depth_limit: 20
+  trades_limit: 1000
+  kline_limit: 1500
+  pagination_sleep_seconds: 0.2
+  incremental: true
+  integrity_check: true
+
+target:
+  horizon_bars: 3
+  neutral_atr_mult: 0.3
+  atr_period: 14
+
+features:
+  lag_periods: 3
+  correlation_threshold: 0.95
+  importance_top_k: 60
+  min_fold_stability: 0.4
+  include_orderbook_features: false
+
+validation:
+  n_folds: 5
+  min_train_rows: 2000
+  min_test_rows: 400
+  # NOTE: there is no purge_bars field here on purpose — purge size must
+  # equal target.horizon_bars exactly (see ValidationConfig's docstring in
+  # config_schema.py), so it is derived from target.horizon_bars rather than
+  # configured independently. Writing validation.purge_bars here would fail
+  # as an unknown key.
+  embargo_bars: 0
+  internal_validation_fraction: 0.2
+  min_class_count: 30
+
+models:
+  random_state: 42
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+  lightgbm:
+    num_leaves: 47
+    learning_rate: 0.037
+    n_estimators: 777
+    min_child_samples: 100
+    subsample: 0.7
+    colsample_bytree: 0.7
+    reg_alpha: 0.5
+    reg_lambda: 2.0
+    early_stopping_rounds: 75
+  catboost:
+    enabled: false
+
+backtest:
+  fee_bps: 4.0
+  slippage_bps: 3.0
+  latency_bps: 1.0
+  funding_bps_per_bar: 0.5
+  default_buy_threshold: 0.55
+  default_sell_threshold: 0.45
+  min_trades_for_tuning: 20
+  threshold_sweep_min: 0.51
+  threshold_sweep_max: 0.80
+  threshold_sweep_step: 0.01
+  initial_equity: 1.0
+  position_fraction: 1.0
+  max_trades_per_day: 50.0
+
+risk:
+  enabled: false
+
+artifacts:
+  root_dir: "artifacts"
+  keep_last_n_experiments: 20
+
+experiment:
+  name: "stage2b_fixture"
+  tags: ["stage2b", "test"]
+  notes: "canonical valid fixture for config schema tests"
+
+live:
+  poll_seconds: 5
+  emit_every_iterations: 12
+  max_iterations: 100000
