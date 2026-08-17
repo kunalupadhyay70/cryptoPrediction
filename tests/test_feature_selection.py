@@ -179,6 +179,17 @@ def test_lgbm_importance_raises_on_missing_class_in_validation():
         )
 
 
+def test_lgbm_importance_exposes_internal_val_probs_in_canonical_order():
+    X_train, y_train, X_val, y_val = _synthetic_classification_data()
+    result = select_features_by_lgbm_importance(
+        X_train, y_train, X_val, y_val,
+        candidate_features=list(X_train.columns), top_k=2, min_class_count=10,
+        early_stopping_rounds=10, lgbm_params={"n_estimators": 60, "num_leaves": 7},
+    )
+    assert result.internal_val_probs.shape == (len(X_val), 3)
+    np.testing.assert_allclose(result.internal_val_probs.sum(axis=1), 1.0, atol=1e-6)
+
+
 def test_lgbm_importance_empty_candidates_raises():
     X_train, y_train, X_val, y_val = _synthetic_classification_data()
     with pytest.raises(FeatureSelectionError):

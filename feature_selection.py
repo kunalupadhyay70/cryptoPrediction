@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from class_checks import check_class_coverage
+from model_training import align_probs_to_class_order
 
 
 class FeatureSelectionError(ValueError):
@@ -68,6 +69,15 @@ class ImportanceSelectionResult:
     selected_features: List[str]
     best_iteration: int
     importances: Dict[str, float]
+    # (n_val, 3) probabilities, canonical (DOWN, NEUTRAL, UP) column order,
+    # from THIS ALREADY-FITTED importance model predicting X_val. Exposed
+    # as a free byproduct (no extra training cost) for Stage 2K's "fold 1:
+    # use fold 1 internal validation predictions" threshold-selection rule.
+    # Fit on the full correlation-pruned candidate set (not narrowed to
+    # selected_features) since that is the actual model that was fit here —
+    # documented as a deliberate approximation of "the final model's
+    # predictions on internal_validation" rather than a separate refit.
+    internal_val_probs: np.ndarray
 
 
 def select_features_by_lgbm_importance(
@@ -130,8 +140,12 @@ def select_features_by_lgbm_importance(
     ranked = sorted(candidate_features, key=lambda f: (-importances[f], f))
     selected = ranked[: min(top_k, len(ranked))]
 
+    raw_val_proba = model.predict_proba(X_val[candidate_features])
+    internal_val_probs = align_probs_to_class_order(raw_val_proba, model.classes_)
+
     return ImportanceSelectionResult(
-        selected_features=selected, best_iteration=best_iteration, importances=importances
+        selected_features=selected, best_iteration=best_iteration, importances=importances,
+        internal_val_probs=internal_val_probs,
     )
 
 

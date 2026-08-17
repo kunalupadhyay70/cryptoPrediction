@@ -101,6 +101,15 @@ class FoldInfo:
     correlation_pruned_features: List[str]
     selected_features: List[str]
     best_iteration: int
+    # Populated ONLY for fold == 1 (None for every later fold): the raw
+    # ingredients Stage 2K's threshold selection needs for its "fold 1: use
+    # fold 1 internal validation predictions" rule. Keyed by the two
+    # threshold-tunable model names (lightgbm, logistic_regression); each
+    # value is {"probs": (n_val, 3) canonical-order array, "tradable_return":
+    # (n_val,) array}. Later folds don't need this — Stage 2K sources their
+    # threshold data directly from already-completed prior-fold OOF rows in
+    # the returned oof_df.
+    fold1_internal_val: dict = None
 
 
 def _chronological_internal_split(
@@ -200,6 +209,35 @@ def generate_oof_predictions(
         selected_features = importance_result.selected_features
         best_iteration = importance_result.best_iteration
 
+        fold1_internal_val = None
+        if split.fold == 1:
+            # Stage 2K needs fold 1's threshold selection sourced from
+            # fold 1's OWN internal_validation predictions (never from
+            # outer_test). LightGBM's come free from the already-fitted
+            # importance-selection model above; Logistic Regression needs
+            # one extra (cheap) fit on internal_train, scored on
+            # internal_validation — mirroring exactly the same
+            # internal_train -> internal_validation split used for
+            # LightGBM, on the same selected_features.
+            logreg_internal_val_probs = fit_logistic_regression_probs(
+                X_all.iloc[internal_train_idx][selected_features], y_internal_train,
+                X_all.iloc[internal_val_idx][selected_features],
+                min_class_count=config.min_class_count, random_state=config.random_state,
+            )
+            internal_val_tradable_return = (
+                dataset["tradable_return"].iloc[internal_val_idx].to_numpy()
+            )
+            fold1_internal_val = {
+                MODEL_LIGHTGBM: {
+                    "probs": importance_result.internal_val_probs,
+                    "tradable_return": internal_val_tradable_return,
+                },
+                MODEL_BASELINE_C: {
+                    "probs": logreg_internal_val_probs,
+                    "tradable_return": internal_val_tradable_return,
+                },
+            }
+
         y_outer_train = y_all_float.iloc[outer_train_idx].astype(int).to_numpy()
         X_outer_train = X_all.iloc[outer_train_idx][selected_features]
         X_outer_test = X_all.iloc[outer_test_idx][selected_features]
@@ -255,6 +293,7 @@ def generate_oof_predictions(
             correlation_pruned_features=pruned,
             selected_features=selected_features,
             best_iteration=best_iteration,
+            fold1_internal_val=fold1_internal_val,
         ))
 
     oof_df = pd.DataFrame(all_rows, columns=OOF_COLUMNS)
