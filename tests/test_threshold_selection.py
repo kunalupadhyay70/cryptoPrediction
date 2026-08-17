@@ -5,7 +5,8 @@ import pytest
 
 from threshold_selection import (
     CLASS_DOWN, CLASS_NEUTRAL, CLASS_UP, SIGNAL_BUY, SIGNAL_HOLD, SIGNAL_SELL,
-    ThresholdSelectionError, apply_thresholds_and_signals, compute_signal, select_threshold,
+    ThresholdSelectionError, apply_thresholds_and_signals, compute_signal,
+    select_production_threshold, select_threshold,
 )
 
 
@@ -227,3 +228,26 @@ def test_apply_thresholds_signal_column_consistent_with_compute_signal():
             group["buy_threshold"].iloc[0], group["sell_threshold"].iloc[0],
         )
         np.testing.assert_array_equal(group["signal"].to_numpy(), recomputed)
+
+
+# ---------------------------------------------------------------------------
+# select_production_threshold (Stage 2P)
+# ---------------------------------------------------------------------------
+
+def test_select_production_threshold_pools_all_folds_for_the_model():
+    oof_df = _synthetic_oof_table()
+    result = select_production_threshold(oof_df, "lightgbm", min_trades_for_tuning=5)
+    # Independently reproduce by pooling all folds' rows for that model.
+    rows = oof_df[oof_df["model"] == "lightgbm"]
+    expected = select_threshold(
+        rows["prob_down"].to_numpy(), rows["prob_neutral"].to_numpy(), rows["prob_up"].to_numpy(),
+        rows["tradable_return"].to_numpy(), min_trades_for_tuning=5,
+    )
+    assert result.buy_threshold == pytest.approx(expected.buy_threshold)
+    assert result.sell_threshold == pytest.approx(expected.sell_threshold)
+
+
+def test_select_production_threshold_unknown_model_raises():
+    oof_df = _synthetic_oof_table()
+    with pytest.raises(ThresholdSelectionError):
+        select_production_threshold(oof_df, "nonexistent_model")

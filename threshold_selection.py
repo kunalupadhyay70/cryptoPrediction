@@ -189,6 +189,42 @@ def select_threshold(
     )
 
 
+def select_production_threshold(
+    oof_df: pd.DataFrame,
+    model: str,
+    threshold_sweep_min: float = 0.34,
+    threshold_sweep_max: float = 0.80,
+    threshold_sweep_step: float = 0.02,
+    min_trades_for_tuning: int = 10,
+    default_buy_threshold: float = 0.40,
+    default_sell_threshold: float = 0.40,
+    cost_one_way: float = 0.0,
+) -> ThresholdResult:
+    """Production/live threshold selection (frozen rule): computed ONCE
+    from the FULL historical OOF table for ``model`` (all folds pooled
+    together), for use in live/future inference only.
+
+    This result must NEVER be retroactively applied to recompute
+    historical headline performance -- the OOF table's own per-fold
+    buy_threshold/sell_threshold columns (already populated, strictly
+    past-only per fold, by apply_thresholds_and_signals) remain the sole
+    source of reported historical performance. This function's output is
+    a separate artifact consumed only by the live/production inference
+    path.
+    """
+    rows = oof_df[oof_df["model"] == model]
+    if rows.empty:
+        raise ThresholdSelectionError(f"no OOF rows found for model {model!r}")
+    return select_threshold(
+        rows["prob_down"].to_numpy(), rows["prob_neutral"].to_numpy(), rows["prob_up"].to_numpy(),
+        rows["tradable_return"].to_numpy(),
+        threshold_sweep_min=threshold_sweep_min, threshold_sweep_max=threshold_sweep_max,
+        threshold_sweep_step=threshold_sweep_step, min_trades_for_tuning=min_trades_for_tuning,
+        default_buy_threshold=default_buy_threshold, default_sell_threshold=default_sell_threshold,
+        cost_one_way=cost_one_way,
+    )
+
+
 def apply_thresholds_and_signals(
     oof_df: pd.DataFrame,
     fold1_internal_val_by_model: dict,

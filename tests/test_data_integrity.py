@@ -296,3 +296,44 @@ def test_integrity_check_is_scoped_to_configured_symbol(tmp_path):
     assert result["rows"] == 3
     assert result["gap_events"] == 0
     assert result["missing_bars"] == 0
+
+
+# ---------------------------------------------------------------------------
+# load_ohlcv_dataframe (Stage 2P) — the single loader handing off from
+# storage to the new causal feature/target pipeline.
+# ---------------------------------------------------------------------------
+
+def test_load_ohlcv_dataframe_returns_sorted_typed_columns(tmp_path):
+    import pandas as pd
+
+    collector = _make_collector(tmp_path, "5m")
+    # Insert out of order to prove the loader sorts ascending, not just
+    # returns insertion order.
+    times = [_iso(m, BASE) for m in (10, 0, 5)]
+    _insert_rows(collector, times)
+
+    df = collector.load_ohlcv_dataframe()
+
+    assert list(df.columns) == ["open_time", "open", "high", "low", "close", "volume"]
+    assert df["open_time"].is_monotonic_increasing
+    assert isinstance(df["open_time"].dtype, pd.DatetimeTZDtype)
+    assert len(df) == 3
+    # Row for minute-0 was inserted with i=1 (index into the original
+    # out-of-order `times` list) -> open=101.0 per _insert_rows' formula.
+    assert df.iloc[0]["open"] == pytest.approx(101.0)
+
+
+def test_load_ohlcv_dataframe_scoped_to_configured_symbol(tmp_path):
+    collector = _make_collector(tmp_path, "5m")
+    _insert_rows(collector, [_iso(m, BASE) for m in (0, 5, 10)], symbol="BTCUSDT")
+    _insert_rows(collector, [_iso(m, BASE) for m in (1000, 1020)], symbol="ETHUSDT")
+
+    df = collector.load_ohlcv_dataframe()
+    assert len(df) == 3
+
+
+def test_load_ohlcv_dataframe_empty_table_returns_empty_frame_with_columns(tmp_path):
+    collector = _make_collector(tmp_path, "5m")
+    df = collector.load_ohlcv_dataframe()
+    assert list(df.columns) == ["open_time", "open", "high", "low", "close", "volume"]
+    assert len(df) == 0

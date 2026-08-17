@@ -470,6 +470,27 @@ class DataCollector:
             "issues": issues,
         }
 
+    def load_ohlcv_dataframe(self):
+        """Load this collector's stored OHLCV rows for its configured
+        symbol as a pandas DataFrame, sorted ascending by open_time, with
+        columns [open_time, open, high, low, close, volume] -- open_time
+        parsed to a tz-aware (UTC) pandas Timestamp column, matching the
+        shape target_engineering/dataset_builder expect (Stage 2P: the
+        single loader used to hand off from storage to the new causal
+        feature/target pipeline; no other module re-implements this
+        query).
+        """
+        import pandas as pd
+
+        with self._connect() as conn:
+            df = pd.read_sql_query(
+                f"SELECT open_time, open, high, low, close, volume "
+                f"FROM {self.ohlcv_table} WHERE symbol = ? ORDER BY open_time ASC",
+                conn, params=(self.config.symbol,),
+            )
+        df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
+        return df
+
     async def collect_orderbook_ws(self, seconds: int) -> None:
         end = time.time() + seconds
         async with websockets.connect(self.config.ws_base_url, ping_interval=20) as ws:
