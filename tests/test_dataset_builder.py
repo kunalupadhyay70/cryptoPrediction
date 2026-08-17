@@ -261,6 +261,16 @@ def test_build_features_does_not_mutate_input(ohlcv):
     pd.testing.assert_frame_equal(ohlcv, original)
 
 
+def test_vol_regime_is_binary_and_matches_expanding_median_definition(ohlcv):
+    feats = build_features(ohlcv, lag_periods=0, atr_period=14)
+    present = feats["vol_regime"].dropna()
+    assert set(present.unique()).issubset({0.0, 1.0})
+    # Hand-recompute independently (expanding median, causal) and compare.
+    expected = (feats["vol_20"] > feats["vol_20"].expanding(min_periods=40).median()).astype(float)
+    expected[feats["vol_20"].isna()] = np.nan
+    pd.testing.assert_series_equal(feats["vol_regime"], expected, check_names=False)
+
+
 def test_build_dataset_without_open_time_skips_time_features(ohlcv):
     df = ohlcv.drop(columns=["open_time"])
     feats = build_features(df)

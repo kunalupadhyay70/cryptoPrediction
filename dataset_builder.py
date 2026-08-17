@@ -157,6 +157,17 @@ def build_features(
         out[f"bb_width_{bbp}"] = (2 * bs) / (bm + 1e-9)
         out[f"bb_pctb_{bbp}"] = (close - (bm - 2 * bs)) / (4 * bs + 1e-9)
 
+    # ── Volatility regime (causal: expanding, not rolling-future, median) ──
+    # 1.0 = current short-window realized vol (vol_20) is ABOVE its own
+    # historical (expanding, i.e. using only rows <= t) median; 0.0 =
+    # at-or-below. expanding(min_periods=...) never looks at a future row,
+    # unlike a centered or trailing-then-shifted rolling median computed
+    # over the whole series would risk if implemented carelessly.
+    out["vol_regime"] = (
+        out["vol_20"] > out["vol_20"].expanding(min_periods=40).median()
+    ).astype(float)
+    out.loc[out["vol_20"].isna(), "vol_regime"] = np.nan
+
     # ── Volume ───────────────────────────────────────────────────────────
     vol_ma20 = volume.rolling(20, min_periods=20).mean()
     out["vol_ratio_20"] = volume / (vol_ma20 + 1e-9)
